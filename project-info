@@ -1,0 +1,674 @@
+#!/usr/bin/env bash
+
+# project-info — Project directory overview
+# Version: 1.2.0
+
+set -o pipefail
+
+VERSION="1.2.0"
+DEFAULT_ROOT="$HOME/Desktop/projects"
+DEFAULT_DEPTH=3
+DEFAULT_SORT="date"
+DEFAULT_LIMIT=0
+
+ROOT="$DEFAULT_ROOT"
+DEPTH="$DEFAULT_DEPTH"
+SORT_BY="$DEFAULT_SORT"
+LIMIT="$DEFAULT_LIMIT"
+GIT_ONLY=false
+VERBOSE=false
+TYPE_FILTERS=()
+
+EXCLUDED_DIRS=(
+    .git
+    node_modules
+    vendor
+    .idea
+    .vscode
+    __pycache__
+    .pytest_cache
+    .mypy_cache
+    .venv
+    venv
+    dist
+    build
+    coverage
+    .next
+    .nuxt
+    target
+    .cache
+)
+
+PROJECT_MARKERS=(
+    composer.json
+    package.json
+    pyproject.toml
+    setup.py
+    requirements.txt
+    Cargo.toml
+    go.mod
+    artisan
+    Makefile
+)
+
+usage() {
+    cat <<EOF
+project-info $VERSION
+
+Usage:
+  project-info [OPTIONS]
+
+Options:
+  -r, --root DIR       Root directory to scan
+  -d, --depth N        Maximum directory depth (default: $DEFAULT_DEPTH)
+  -n, --limit N        Maximum number of projects to display (0 = unlimited)
+  -s, --sort FIELD     Sort by: date, name, size (default: $DEFAULT_SORT)
+  -t, --type TYPE      Filter by project type
+                       Multiple types can be comma-separated
+  -g, --git            Show only Git repositories
+  -v, --verbose        Show category and full project path
+  -h, --help           Display this help
+      --version        Display version
+
+Project types:
+  Laravel
+  Vue
+  React
+  PHP
+  Python
+  Rust
+  Go
+  JavaScript
+  HTML/CSS
+  Bash
+  Make
+  Git project
+  Unknown
+
+Examples:
+  project-info
+  project-info --root ~/Projects
+  project-info --depth 4 --sort date
+  project-info --limit 10 --sort size
+  project-info --type Bash
+  project-info --type "Laravel,Vue"
+  project-info --type "HTML/CSS,JavaScript"
+  project-info --git
+  project-info --git --type Bash
+  project-info --verbose
+EOF
+}
+
+error() {
+    printf 'Error: %s\n' "$1" >&2
+    exit 1
+}
+
+# --------------------------------------------------
+# Argument parsing
+# --------------------------------------------------
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -r|--root)
+            [[ -n "${2:-}" ]] || error "Missing directory after $1"
+            ROOT="$2"
+            shift 2
+            ;;
+        -d|--depth)
+            [[ "${2:-}" =~ ^[1-9][0-9]*$ ]] ||
+                error "Depth must be a positive integer"
+            DEPTH="$2"
+            shift 2
+            ;;
+        -n|--limit)
+            [[ "${2:-}" =~ ^[0-9]+$ ]] ||
+                error "Limit must be a non-negative integer"
+            LIMIT="$2"
+            shift 2
+            ;;
+        -s|--sort)
+            [[ -n "${2:-}" ]] || error "Missing sort field"
+            SORT_BY="${2,,}"
+            shift 2
+            ;;
+        -t|--type)
+            [[ -n "${2:-}" ]] || error "Missing project type"
+            TYPE_FILTERS+=("$2")
+            shift 2
+            ;;
+        -g|--git)
+            GIT_ONLY=true
+            shift
+            ;;
+        -v|--verbose)
+            VERBOSE=true
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        --version)
+            printf 'project-info %s\n' "$VERSION"
+            exit 0
+            ;;
+        *)
+            error "Unknown option: $1 (use --help)"
+            ;;
+    esac
+done
+
+[[ -d "$ROOT" ]] || error "Directory does not exist: $ROOT"
+
+ROOT="$(cd -- "$ROOT" && pwd -P)"
+
+case "$SORT_BY" in
+    date|name|size) ;;
+    *) error "Invalid sort field: $SORT_BY (use date, name or size)" ;;
+esac
+
+# --------------------------------------------------
+# Directory helpers
+# --------------------------------------------------
+
+is_excluded_name() {
+    local name="$1"
+    local excluded
+
+    for excluded in "${EXCLUDED_DIRS[@]}"; do
+        [[ "$name" == "$excluded" ]] && return 0
+    done
+
+    return 1
+}
+
+find_project_files() {
+    local dir="$1"
+
+    find "$dir" -maxdepth 2 \
+        \( -type d \( \
+            -name .git -o \
+            -name node_modules -o \
+            -name vendor -o \
+            -name .idea -o \
+            -name .vscode -o \
+            -name __pycache__ -o \
+            -name .pytest_cache -o \
+            -name .mypy_cache -o \
+            -name .venv -o \
+            -name venv -o \
+            -name dist -o \
+            -name build -o \
+            -name coverage -o \
+            -name .next -o \
+            -name .nuxt -o \
+            -name target -o \
+            -name .cache \
+        \) -prune \) -o \
+        -type f -print0
+}
+
+has_bash_files() {
+    local dir="$1"
+    local file
+    local first_line
+
+    while IFS= read -r -d '' file; do
+        case "$file" in
+            *.sh|*.bash)
+                return 0
+                ;;
+        esac
+
+        IFS= read -r first_line < "$file" || true
+
+        if [[ "$first_line" =~ ^\#!.*(bash|/env[[:space:]]+.*bash) ]]; then
+            return 0
+        fi
+    done < <(find_project_files "$dir")
+
+    return 1
+}
+
+has_root_bash_file() {
+    local dir="$1"
+    local file
+    local first_line
+
+    while IFS= read -r -d '' file; do
+        case "$file" in
+            "$dir"/*.sh|"$dir"/*.bash)
+                return 0
+                ;;
+        esac
+
+        IFS= read -r first_line < "$file" || true
+
+        if [[ "$first_line" =~ ^\#!.*(bash|/env[[:space:]]+.*bash) ]]; then
+            return 0
+        fi
+    done < <(
+        find "$dir" -maxdepth 1 -type f -print0
+    )
+
+    return 1
+}
+
+has_project_marker() {
+    local dir="$1"
+    local marker
+
+    # Explicit marker: always treat this directory as a project.
+    [[ -e "$dir/.project-info" ]] && return 0
+
+    # Git repository or worktree.
+    [[ -e "$dir/.git" ]] && return 0
+
+    # Common project manifests and entry points.
+    for marker in "${PROJECT_MARKERS[@]}"; do
+        [[ -e "$dir/$marker" ]] && return 0
+    done
+
+    # Standalone Bash project:
+    # root-level shell script(s) + README.md.
+    # Generic internal directories need an explicit marker or Git repository.
+    local dir_name
+    dir_name="$(basename "$dir")"
+
+    case "$dir_name" in
+        tests|test|src|docs|bin|scripts)
+            return 1
+            ;;
+    esac
+
+    if [[ -f "$dir/README.md" ]] && has_root_bash_file "$dir"; then
+        return 0
+    fi
+
+    return 1
+}
+
+# --------------------------------------------------
+# Project type detection
+# --------------------------------------------------
+
+get_project_type() {
+    local dir="$1"
+
+    # Frameworks first.
+    if [[ -f "$dir/artisan" ]]; then
+        printf 'Laravel'
+        return
+    fi
+
+    if [[ -f "$dir/package.json" ]]; then
+        if grep -Eq '"vue"[[:space:]]*:' "$dir/package.json"; then
+            printf 'Vue'
+            return
+        fi
+
+        if grep -Eq '"react"[[:space:]]*:' "$dir/package.json"; then
+            printf 'React'
+            return
+        fi
+    fi
+
+    # Language-specific project manifests.
+    if [[ -f "$dir/composer.json" ]]; then
+        printf 'PHP'
+        return
+    fi
+
+    if [[ -f "$dir/pyproject.toml" ||
+          -f "$dir/setup.py" ||
+          -f "$dir/requirements.txt" ]]; then
+        printf 'Python'
+        return
+    fi
+
+    if [[ -f "$dir/Cargo.toml" ]]; then
+        printf 'Rust'
+        return
+    fi
+
+    if [[ -f "$dir/go.mod" ]]; then
+        printf 'Go'
+        return
+    fi
+
+    # JavaScript projects.
+    if [[ -f "$dir/package.json" ]]; then
+        printf 'JavaScript'
+        return
+    fi
+
+    # Static HTML/CSS project.
+    if [[ -f "$dir/index.html" ]] &&
+       find "$dir" -maxdepth 2 -type f -name '*.css' -print -quit |
+           grep -q .; then
+        printf 'HTML/CSS'
+        return
+    fi
+
+    # Static JavaScript project.
+    if [[ -f "$dir/index.html" ]] &&
+       find "$dir" -maxdepth 2 -type f \
+           \( -name '*.js' -o -name '*.mjs' \) \
+           -print -quit | grep -q .; then
+        printf 'JavaScript'
+        return
+    fi
+
+    # Bash projects.
+    if has_bash_files "$dir"; then
+        printf 'Bash'
+        return
+    fi
+
+    if [[ -f "$dir/Makefile" ]]; then
+        printf 'Make'
+        return
+    fi
+
+    if [[ -e "$dir/.git" ]]; then
+        printf 'Git project'
+        return
+    fi
+
+    printf 'Unknown'
+}
+
+# --------------------------------------------------
+# Type filter
+# --------------------------------------------------
+
+normalize_type() {
+    local value="${1,,}"
+
+    value="${value//[[:space:]]/}"
+    value="${value//-/\/}"
+
+    case "$value" in
+        js) value="javascript" ;;
+        py) value="python" ;;
+        htmlcss|html/css) value="html/css" ;;
+        git|gitproject|git/project) value="gitproject" ;;
+    esac
+
+    printf '%s' "$value"
+}
+
+matches_type_filter() {
+    local project_type="$1"
+    local filter
+    local requested
+    local normalized_project_type
+
+    [[ ${#TYPE_FILTERS[@]} -eq 0 ]] && return 0
+
+    normalized_project_type="$(normalize_type "$project_type")"
+
+    for filter in "${TYPE_FILTERS[@]}"; do
+        IFS=',' read -ra requested_types <<< "$filter"
+
+        for requested in "${requested_types[@]}"; do
+            requested="$(normalize_type "${requested//[[:space:]]/}")"
+
+            if [[ "$requested" == "$normalized_project_type" ]]; then
+                return 0
+            fi
+        done
+    done
+
+    return 1
+}
+
+# --------------------------------------------------
+# Project metadata
+# --------------------------------------------------
+
+get_last_modified() {
+    local dir="$1"
+
+    find_project_files "$dir" |
+        xargs -0 -r stat -c '%Y' 2>/dev/null |
+        awk 'BEGIN { max = 0 } $1 > max { max = $1 } END { print max }'
+}
+
+get_project_size() {
+    local dir="$1"
+
+    du -sb \
+        --exclude=.git \
+        --exclude=node_modules \
+        --exclude=vendor \
+        --exclude=.venv \
+        --exclude=venv \
+        --exclude=__pycache__ \
+        --exclude=dist \
+        --exclude=build \
+        --exclude=target \
+        "$dir" 2>/dev/null |
+        awk '{ print $1 }'
+}
+
+format_size() {
+    numfmt --to=iec --suffix=B "${1:-0}" 2>/dev/null || printf '0B'
+}
+
+get_category() {
+    local dir="$1"
+    local relative="${dir#"$ROOT"/}"
+
+    if [[ "$relative" == */* ]]; then
+        printf '%s' "${relative%%/*}"
+    else
+        printf '-'
+    fi
+}
+
+get_git_info() {
+    local dir="$1"
+    local branch="-"
+    local status="-"
+    local top_level
+
+    if [[ ! -e "$dir/.git" ]]; then
+        printf '%s\t%s' "$branch" "$status"
+        return
+    fi
+
+    top_level="$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null)" ||
+        {
+            printf '%s\t%s' "$branch" "$status"
+            return
+        }
+
+    top_level="$(cd -- "$top_level" 2>/dev/null && pwd -P)"
+
+    # Do not report the status of a parent repository.
+    if [[ "$top_level" != "$dir" ]]; then
+        printf '%s\t%s' "$branch" "$status"
+        return
+    fi
+
+    branch="$(git -C "$dir" branch --show-current 2>/dev/null)"
+
+    if [[ -z "$branch" ]]; then
+        branch="detached"
+    fi
+
+    if git -C "$dir" status --porcelain --untracked-files=normal \
+        2>/dev/null | grep -q .; then
+        status="Dirty"
+    else
+        status="Clean"
+    fi
+
+    printf '%s\t%s' "$branch" "$status"
+}
+
+# --------------------------------------------------
+# Temporary data file
+# --------------------------------------------------
+
+DATA_FILE="$(mktemp)" || error "Cannot create temporary file"
+
+cleanup() {
+    rm -f -- "$DATA_FILE"
+}
+
+trap cleanup EXIT
+
+# --------------------------------------------------
+# Project discovery
+# --------------------------------------------------
+
+while IFS= read -r -d '' dir; do
+    has_project_marker "$dir" || continue
+
+    project_type="$(get_project_type "$dir")"
+
+    matches_type_filter "$project_type" || continue
+
+    git_info="$(get_git_info "$dir")"
+    IFS=$'\t' read -r branch git_status <<< "$git_info"
+
+    if [[ "$GIT_ONLY" == true && "$branch" == "-" ]]; then
+        continue
+    fi
+
+    timestamp="$(get_last_modified "$dir")"
+    [[ -n "$timestamp" ]] || timestamp=0
+
+    modified="$(date -d "@$timestamp" '+%Y-%m-%d %H:%M' 2>/dev/null)"
+    [[ -n "$modified" ]] || modified="-"
+
+    size_bytes="$(get_project_size "$dir")"
+    [[ "$size_bytes" =~ ^[0-9]+$ ]] || size_bytes=0
+
+    size_human="$(format_size "$size_bytes")"
+    project_name="$(basename "$dir")"
+    category="$(get_category "$dir")"
+
+    # First column is the numeric sort key.
+    case "$SORT_BY" in
+        date) sort_key="$timestamp" ;;
+        name) sort_key="$project_name" ;;
+        size) sort_key="$size_bytes" ;;
+    esac
+
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$sort_key" \
+        "$project_name" \
+        "$modified" \
+        "$size_bytes" \
+        "$size_human" \
+        "$project_type" \
+        "$branch" \
+        "$git_status" \
+        "$category" \
+        "$dir" >> "$DATA_FILE"
+
+done < <(
+    find "$ROOT" \
+        -mindepth 1 \
+        -maxdepth "$DEPTH" \
+        -type d \
+        \( \
+            -name .git -o \
+            -name node_modules -o \
+            -name vendor -o \
+            -name .idea -o \
+            -name .vscode -o \
+            -name __pycache__ -o \
+            -name .pytest_cache -o \
+            -name .mypy_cache -o \
+            -name .venv -o \
+            -name venv -o \
+            -name dist -o \
+            -name build -o \
+            -name coverage -o \
+            -name .next -o \
+            -name .nuxt -o \
+            -name target -o \
+            -name .cache \
+        \) -prune -o \
+        -type d -print0
+)
+
+# --------------------------------------------------
+# Sorting and output
+# --------------------------------------------------
+
+case "$SORT_BY" in
+    date)
+        SORTED_DATA="$(sort -t $'\t' -k1,1nr "$DATA_FILE")"
+        ;;
+    name)
+        SORTED_DATA="$(sort -t $'\t' -k2,2f "$DATA_FILE")"
+        ;;
+    size)
+        SORTED_DATA="$(sort -t $'\t' -k4,4nr "$DATA_FILE")"
+        ;;
+esac
+
+printf '\n'
+printf 'Project directory: %s\n' "$ROOT"
+printf 'Sort: %s | Depth: %s' "$SORT_BY" "$DEPTH"
+
+if [[ ${#TYPE_FILTERS[@]} -gt 0 ]]; then
+    printf ' | Type: %s' "$(IFS=', '; echo "${TYPE_FILTERS[*]}")"
+fi
+
+[[ "$GIT_ONLY" == true ]] && printf ' | Git only'
+printf '\n\n'
+
+if [[ "$VERBOSE" == true ]]; then
+    printf '%-24s %-16s %8s %-14s %-16s %-10s %-10s %s\n' \
+        "PROJECT" "LAST MODIFIED" "SIZE" "TYPE" "BRANCH" "STATUS" "CATEGORY" "PATH"
+    printf '%s\n' \
+        "------------------------------------------------------------------------------------------------------------------------------------------------"
+else
+    printf '%-24s %-16s %8s %-14s %-16s %-10s %s\n' \
+        "PROJECT" "LAST MODIFIED" "SIZE" "TYPE" "BRANCH" "STATUS" "CATEGORY"
+    printf '%s\n' \
+        "-------------------------------------------------------------------------------------------------------------------------------"
+fi
+
+PROJECTS_FOUND=0
+PROJECTS_DISPLAYED=0
+
+while IFS=$'\t' read -r \
+    sort_key project_name modified size_bytes size_human \
+    project_type branch git_status category path; do
+
+    [[ -n "$project_name" ]] || continue
+
+    PROJECTS_FOUND=$((PROJECTS_FOUND + 1))
+
+    if [[ "$LIMIT" -gt 0 && "$PROJECTS_DISPLAYED" -ge "$LIMIT" ]]; then
+        continue
+    fi
+
+    if [[ "$VERBOSE" == true ]]; then
+        printf '%-24.24s %-16s %8s %-14s %-16.16s %-10s %-10s %s\n' \
+            "$project_name" "$modified" "$size_human" "$project_type" \
+            "$branch" "$git_status" "$category" "$path"
+    else
+        printf '%-24.24s %-16s %8s %-14s %-16.16s %-10s %s\n' \
+            "$project_name" "$modified" "$size_human" "$project_type" \
+            "$branch" "$git_status" "$category"
+    fi
+
+    PROJECTS_DISPLAYED=$((PROJECTS_DISPLAYED + 1))
+
+done <<< "$SORTED_DATA"
+
+if [[ "$PROJECTS_FOUND" -eq 0 ]]; then
+    printf 'No projects found.\n'
+fi
+
+printf '\nProjects found: %s\n' "$PROJECTS_FOUND"
+printf 'Projects displayed: %s\n' "$PROJECTS_DISPLAYED"
